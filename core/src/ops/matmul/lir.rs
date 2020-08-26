@@ -3,12 +3,115 @@ use std::fmt;
 use std::ops::{Add, Mul};
 
 use crate::internal::*;
+use crate::ops;
 use ndarray::*;
 
 use super::MMMWrapper;
 use tract_linalg::mmm::FusedSpec;
 
 use tract_linalg::frame::PackB;
+
+fn i32_optimized_scale_factor(factor: f32) -> (i32, usize) {
+    // https://github.com/microsoft/onnxruntime/blob/master/onnxruntime/core/util/gemmlowp_common.h#L16
+    let factor_bits = factor.to_bits();
+    let current_exponent = factor_bits >> 23;
+    let bumped_multi = f32::from_bits(factor_bits & 0x007fffff | 0x3f000000);
+    let int_multi = (bumped_multi * (1i64 << 31) as f32).round() as i32;
+    let shift = 126 - current_exponent;
+    (int_multi, shift as usize)
+}
+
+pub trait FusableOps: Datum + std::fmt::Debug + Copy + Mul + Zero {
+    fn fusable_ops<TA, TB, TC>(
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>>
+    where
+        TA: Datum + Copy + Zero,
+        TB: Datum + Copy + Zero,
+        TC: Datum + Copy;
+}
+
+impl FusableOps for i32 {
+    fn fusable_ops<TA, TB, TC>(
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>>
+    where
+        TA: Datum + Copy + Zero,
+        TB: Datum + Copy + Zero,
+        TC: Datum + Copy,
+    {
+        let me = node.op_as::<MatMatMulUnaryFinite<TA, TB, TC, i32>>().unwrap().clone();
+        let mmm = me.mmm.as_mmm();
+        if let Some(succ) = model.single_succ(node.id)? {
+            if let Some(op) = succ.op_as::<ops::element_wise::ElementWiseOp>() {
+                if let Some(q) = op.0.downcast_ref::<ops::quant::QScaleInt32>() {
+                    let pair = i32_optimized_scale_factor(q.scale);
+                    let mut op = me.clone();
+                    op.fuse_mini_ops(tvec!(FusedSpec::QTowardsPlusInf(pair.0, pair.1)));
+                    Ok(Some(TypedModelPatch::fuse_with_next(model, node, op)?))
+                } else if let Some(cast) = op.0.downcast_ref::<ops::cast::Cast>() {
+                    let casted: Option<Box<dyn TypedOp>> = if cast.to == i8::datum_type() {
+                        Some(Box::new(MatMatMulUnaryFinite::<i8, i8, i8, i32> {
+                            c_trans: me.c_trans,
+                            bc_c_shape: me.bc_c_shape,
+                            c_fact: TypedFact::shape::<i8, _, _>(me.c_fact.shape)?,
+                            c_prefix_dim_and_stride: me.c_prefix_dim_and_stride,
+                            fused_ops: me.fused_ops,
+                            packed_as: me.packed_as,
+                            mmm: MMMWrapper::Quant((tract_linalg::ops().qmmm_i8_i8)(
+                                mmm.m(),
+                                mmm.k(),
+                                mmm.n(),
+                            )),
+                        }))
+                    } else if cast.to == u8::datum_type() {
+                        Some(Box::new(MatMatMulUnaryFinite::<u8, u8, u8, i32> {
+                            c_trans: me.c_trans,
+                            bc_c_shape: me.bc_c_shape,
+                            c_fact: TypedFact::shape::<u8, _, _>(me.c_fact.shape)?,
+                            c_prefix_dim_and_stride: me.c_prefix_dim_and_stride,
+                            fused_ops: me.fused_ops,
+                            packed_as: me.packed_as,
+                            mmm: MMMWrapper::Quant((tract_linalg::ops().qmmm_u8_u8)(
+                                mmm.m(),
+                                mmm.k(),
+                                mmm.n(),
+                            )),
+                        }))
+                    } else {
+                        None
+                    };
+                    if let Some(op) = casted {
+                        return Ok(Some(TypedModelPatch::fuse_with_next(model, &node, op)?));
+                    }
+                    Ok(None)
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl FusableOps for f32 {
+    fn fusable_ops<TA, TB, TC>(
+        _model: &TypedModel,
+        _node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>>
+    where
+        TA: Datum + Copy + Zero,
+        TB: Datum + Copy + Zero,
+        TC: Datum + Copy,
+    {
+        Ok(None)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Educe)]
 #[educe(Hash)]
@@ -106,6 +209,23 @@ where
     pub(crate) mmm: MMMWrapper<TA, TB, TC, TI>,
 }
 
+impl<TA, TB, TC, TI> MatMatMulUnaryFinite<TA, TB, TC, TI>
+where
+    TA: Datum + Copy + Zero,
+    TB: Datum + Copy + Zero,
+    TC: Datum + Copy,
+    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug,
+{
+    fn fuse_mini_ops(&mut self, ops: TVec<FusedSpec<TI>>) {
+        if self.fused_ops.is_none() {
+            let shape =
+                vec![1; self.c_prefix_dim_and_stride.as_ref().map(|c| c.0.len()).unwrap_or(0)];
+            self.fused_ops = Some(ArrayD::from_shape_fn(shape, |_| vec![]))
+        }
+        self.fused_ops.as_mut().unwrap().map_inplace(|v| v.extend(ops.iter().cloned()));
+    }
+}
+
 impl<TA, TB, TC, TI> DynHash for MatMatMulUnaryFinite<TA, TB, TC, TI>
 where
     TA: Datum + Copy + Zero,
@@ -123,7 +243,7 @@ where
     TA: Datum + Copy + Zero,
     TB: Datum + Copy + Zero,
     TC: Datum + Copy,
-    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug,
+    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug + FusableOps,
 {
     fn name(&self) -> Cow<str> {
         if self.mmm.as_mmm().n() == 1 { "MatVecMul" } else { "MatMatMul" }.into()
@@ -155,7 +275,7 @@ where
     TA: Datum + Copy + Zero,
     TB: Datum + Copy + Zero,
     TC: Datum + Copy,
-    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug,
+    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug + FusableOps,
 {
     fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
         unsafe {
@@ -214,7 +334,7 @@ where
     TA: Datum + Copy + Zero,
     TB: Datum + Copy + Zero,
     TC: Datum + Copy,
-    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug,
+    TI: Datum + Copy + Add + Mul + Zero + fmt::Debug + FusableOps,
 {
     fn output_facts(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         Ok(tvec!(self.c_fact.clone()))
@@ -233,7 +353,6 @@ where
     }
 
     fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
-        use crate::ops;
         if let Some(succ) = model.single_succ(node.id)? {
             if let Some(op) = succ.op_as::<ops::AxisOp>() {
                 if op.only_shape() {
@@ -243,6 +362,9 @@ where
                         Self { c_fact: succ.outputs[0].fact.clone(), ..self.clone() },
                     )?));
                 }
+            }
+            if let Some(patch) = TI::fusable_ops::<TA, TB, TC>(model, node)? {
+                return Ok(Some(patch));
             }
             let fused_micro_op = if let Some(op) = succ.op_as::<ops::binary::UnaryOp>() {
                 let m = self.mmm.as_mmm().m();
@@ -274,19 +396,7 @@ where
             };
             if let Some(op) = fused_micro_op {
                 let mut new_op = self.clone();
-                new_op
-                    .fused_ops
-                    .get_or_insert_with(|| {
-                        let shape = vec![
-                            1;
-                            self.c_prefix_dim_and_stride
-                                .as_ref()
-                                .map(|c| c.0.len())
-                                .unwrap_or(0)
-                        ];
-                        ArrayD::from_shape_fn(shape, |_| vec![])
-                    })
-                    .map_inplace(|v| v.extend(op.iter().cloned()));
+                new_op.fuse_mini_ops(op);
                 return Ok(Some(TypedModelPatch::fuse_with_next(model, &node, new_op)?));
             }
         }
