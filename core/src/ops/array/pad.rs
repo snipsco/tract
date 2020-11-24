@@ -22,7 +22,7 @@ pub struct Pad {
 impl_dyn_hash!(Pad);
 
 impl Pad {
-    fn eval_t<T>(&self, input: Arc<Tensor>) -> TractResult<Arc<Tensor>>
+    fn eval_t<T>(&self, input: TensorVar) -> TractResult<Tensor>
     where
         T: Copy + Datum,
     {
@@ -79,7 +79,7 @@ impl Pad {
                 }
             }
         }
-        Ok(output.into_arc_tensor())
+        Ok(output.into_tensor())
     }
 }
 
@@ -101,9 +101,9 @@ impl EvalOp for Pad {
         true
     }
 
-    fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
+    fn eval(&self, mut inputs: TVec<TensorVar>) -> TractResult<TVec<Box<Tensor>>> {
         let input = args_1!(inputs);
-        Ok(tvec!(dispatch_numbers!(Self::eval_t(input.datum_type())(self, input))?))
+        Ok(tvec!(dispatch_numbers!(Self::eval_t(input.datum_type())(self, input))?.boxed()))
     }
 }
 

@@ -24,7 +24,6 @@ where
     pub model: M,
     pub outputs: Vec<OutletId>,
     pub order: Vec<usize>,
-    pub flush_lists: Vec<TVec<usize>>,
     _casper: PhantomData<(F, O)>,
 }
 
@@ -67,22 +66,10 @@ where
         for o in outputs.iter() {
             values_needed_until_step[o.node] = order.len();
         }
-        let mut flush_lists: Vec<TVec<usize>> = vec![tvec!(); order.len() + 1];
-        for (node, &flush_at) in values_needed_until_step.iter().enumerate() {
-            if flush_at != 0 {
-                flush_lists[flush_at].push(node)
-            }
-        }
-        Ok(SimplePlan {
-            model,
-            order,
-            flush_lists,
-            outputs: outputs.to_vec(),
-            _casper: PhantomData,
-        })
+        Ok(SimplePlan { model, order, outputs: outputs.to_vec(), _casper: PhantomData })
     }
 
-    pub fn run(&self, inputs: TVec<Tensor>) -> TractResult<TVec<Arc<Tensor>>> {
+    pub fn run(&self, inputs: TVec<TensorVar>) -> TractResult<TVec<Box<Tensor>>> {
         let mut state = SimpleState::new(self)?;
         state.run(inputs)
     }
@@ -103,7 +90,7 @@ where
     plan: P,
     pub states: Vec<Option<Box<dyn OpState>>>,
     pub session_state: SessionState,
-    pub values: Vec<Option<TVec<Arc<Tensor>>>>,
+    pub values: Vec<Option<TVec<(usize, Option<Box<Tensor>>)>>>,
     _phantom: PhantomData<(M, F, O)>,
 }
 
@@ -145,27 +132,27 @@ where
         Ok(())
     }
 
-    pub fn run(&mut self, inputs: TVec<Tensor>) -> TractResult<TVec<Arc<Tensor>>> {
+    pub fn run(&mut self, inputs: TVec<TensorVar>) -> TractResult<TVec<Box<Tensor>>> {
         self.run_plan_with_eval(inputs, self::eval)
     }
 
     pub fn run_plan_with_eval<Eval, E>(
         &mut self,
-        inputs: TVec<Tensor>,
+        inputs: TVec<TensorVar>,
         mut eval: Eval,
-    ) -> TractResult<TVec<Arc<Tensor>>>
+    ) -> TractResult<TVec<Box<Tensor>>>
     where
         Eval: for<'a, 'b, 'c> FnMut(
             &'a mut SessionState,
             Option<&'b mut (dyn OpState + 'static)>,
             &'c Node<F, O>,
-            TVec<Arc<Tensor>>,
-        ) -> Result<TVec<Arc<Tensor>>, E>,
+            TVec<TensorVar>,
+        ) -> Result<TVec<Box<Tensor>>, E>,
         E: Into<anyhow::Error> + Send + Sync + 'static,
     {
-        let mut result = tvec!();
-        {
-            self.set_inputs(inputs)?;
+        let mut result: TVec<Box<Tensor>> = tvec!();
+        unsafe {
+            self.set_inputs(inputs.into_iter().map(|t| t.into_tensor()).collect())?;
             let &mut SimpleState {
                 ref plan,
                 ref mut session_state,
@@ -175,23 +162,34 @@ where
             } = self;
             let plan = plan.borrow();
             let model = plan.model().borrow();
+            let mut exclusive: TVec<Option<TensorVar>> = tvec!();
             for (step, n) in plan.order.iter().enumerate() {
                 let node = model.node(*n);
                 trace!("Running step {}, node {}", step, node);
-                let mut inputs: TVec<Arc<Tensor>> = tvec![];
-                for i in &node.inputs {
-                    trace!("  use input {:?}", i);
-                    let prec_node = model.node(i.node);
-                    let prec = values[i.node].as_ref().ok_or_else(|| {
-                        format_err!("Computing {}, precursor {} not done:", node, prec_node)
-                    })?;
-                    inputs.push(prec[i.slot].clone().into())
+                for i in node.inputs.iter() {
+                    let value = values
+                        .get_unchecked_mut(i.node)
+                        .as_mut()
+                        .unwrap()
+                        .get_unchecked_mut(i.slot);
+                    value.0 -= 1;
+                    if value.0 == 0 {
+                        exclusive.push(Some(TensorVar::Exclusive(value.1.take().unwrap())))
+                    } else {
+                        exclusive.push(None)
+                    }
                 }
-
-                for flush in &plan.flush_lists[step] {
-                    trace!("  Ran {} can now flush {}", node, model.node(*flush));
-                    values[*flush] = None;
-                }
+                let inputs: TVec<TensorVar> = exclusive
+                    .drain(..)
+                    .zip(node.inputs.iter())
+                    .map(|(v, i)| {
+                        v.unwrap_or_else(|| {
+                            TensorVar::Borrow(
+                                values[i.node].as_ref().unwrap()[i.slot].1.as_ref().unwrap(),
+                            )
+                        })
+                    })
+                    .collect();
 
                 if cfg!(debug_assertions) {
                     let facts = model.node_input_facts(node.id)?;
@@ -204,7 +202,7 @@ where
                         );
                     }
                     for (ix, (v, f)) in inputs.iter().zip(facts.iter()).enumerate() {
-                        if !f.matches(v)? {
+                        if !f.matches(&*v)? {
                             bail!(
                                 "Evaluating {}: input {:?}, expected {:?}, got {:?}",
                                 node,
@@ -246,11 +244,25 @@ where
                     }
                 }
 
-                values[node.id] = Some(vs);
+                values[node.id] = Some(
+                    vs.into_iter()
+                        .enumerate()
+                        .map(|(ix, t)| {
+                            let successors = node.outputs[ix].successors.len();
+                            let outputs = model
+                                .borrow()
+                                .outputs
+                                .iter()
+                                .filter(|o| **o == (node.id, ix).into())
+                                .count();
+                            (successors + outputs, Some(t))
+                        })
+                        .collect(),
+                );
             }
             for output in &plan.outputs {
                 trace!("Extracting value {:?} ({})", output, model.node(output.node));
-                result.push(values[output.node].as_ref().unwrap()[output.slot].clone())
+                result.push(values[output.node].as_mut().unwrap()[output.slot].1.take().unwrap())
             }
         }
         self.reset_wires()?;
@@ -280,9 +292,9 @@ where
         Ok(())
     }
 
-    pub fn take_outputs(&mut self) -> TractResult<Vec<Arc<Tensor>>> {
+    pub fn take_outputs(&mut self) -> TractResult<TVec<Tensor>> {
         let SimpleState { ref plan, ref mut values, .. } = self;
-        let mut v = vec![];
+        let mut v = tvec![];
         for o in plan.borrow().model().output_outlets()?.iter() {
             let vs = values[o.node].as_mut().ok_or_else(|| {
                 format_err!(
@@ -290,13 +302,21 @@ where
                     &plan.borrow().model().nodes()[o.node]
                 )
             })?;
-            v.push(vs[o.slot].clone())
+            v.push(*(vs[o.slot].clone().1.unwrap()))
         }
         Ok(v)
     }
 
     pub fn set_values(&mut self, id: usize, values: TVec<Tensor>) -> TractResult<()> {
-        self.values[id] = Some(values.into_iter().map(|t| t.into()).collect());
+        self.values[id] = Some(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(ix, t)| {
+                    (self.model().node(id).outputs[ix].successors.len(), Some(Box::new(t)))
+                })
+                .collect(),
+        );
         Ok(())
     }
 
@@ -304,46 +324,7 @@ where
         self.set_values(id, tvec!(value))
     }
 
-    pub fn prepare_inputs(&self, node: usize) -> TractResult<TVec<Arc<Tensor>>> {
-        let SimpleState { ref plan, ref values, .. } = self;
-        let plan = plan.borrow();
-        let nodes = plan.model().nodes();
-        let node = &nodes[node];
-        let mut inputs: TVec<Arc<Tensor>> = tvec![];
-        for i in &node.inputs {
-            let prec_node = &nodes[i.node];
-            let prec = values[i.node].as_ref().ok_or_else(|| {
-                format_err!("Computing {}, precursor {} not done.", node, prec_node)
-            })?;
-            inputs.push(prec[i.slot].clone().into_tensor().into_arc_tensor())
-        }
-        Ok(inputs)
-    }
-
-    pub fn compute_one(&mut self, node: usize) -> TractResult<()> {
-        let inputs = self.prepare_inputs(node)?;
-        self.compute_one_with_inputs(node, inputs)
-    }
-
-    pub fn compute_one_with_inputs(
-        &mut self,
-        node: usize,
-        inputs: TVec<Arc<Tensor>>,
-    ) -> TractResult<()> {
-        let SimpleState { ref plan, ref mut session_state, ref mut values, .. } = self;
-        let plan = plan.borrow();
-        let nodes = plan.model().nodes();
-        let node = &nodes[node];
-        let vs = match self.states[node.id] {
-            Some(ref mut state) => state.eval(session_state, node.op(), inputs),
-            None => node.op().eval(inputs),
-        }
-        .with_context(|| format!("Evaluating {}", node))?;
-        values[node.id] = Some(vs);
-        Ok(())
-    }
-
-    pub fn compute_recursively(&mut self, node: usize) -> TractResult<&[Arc<Tensor>]> {
+    pub fn compute_recursively(&mut self, node: usize) -> TractResult<TVec<&Tensor>> {
         let values = {
             let precs: Vec<usize> =
                 self.model().nodes()[node].inputs.iter().map(|i| i.node).collect();
@@ -352,11 +333,13 @@ where
                     let _ = self.compute_recursively(i)?;
                 }
             }
-            let mut inputs: TVec<Arc<Tensor>> = tvec![];
+            let mut inputs: TVec<TensorVar> = tvec![];
             {
                 let node = &self.model().nodes()[node];
                 for i in &node.inputs {
-                    inputs.push(self.values[i.node].as_ref().unwrap()[i.slot].clone().into())
+                    inputs.push(TensorVar::Borrow(
+                        self.values[i.node].as_ref().unwrap()[i.slot].1.as_ref().unwrap(),
+                    ))
                 }
             }
             let Self { ref mut states, ref mut session_state, ref plan, .. } = self;
@@ -369,8 +352,8 @@ where
             }
             .with_context(|| format!("Evaluating {:?}", node))?
         };
-        self.values[node] = Some(values);
-        Ok(&*self.values[node].as_ref().unwrap())
+        self.values[node] = Some(values.into_iter().map(|t| (1, Some(t))).collect());
+        Ok(self.values[node].as_ref().unwrap().iter().map(|t| &**t.1.as_ref().unwrap()).collect())
     }
 
     pub fn take_by_name(&mut self, name: &str) -> TractResult<TVec<Tensor>> {
@@ -383,7 +366,7 @@ where
             .take()
             .ok_or_else(|| format_err!("Node is not computed"))?
             .into_iter()
-            .map(|v| Arc::try_unwrap(v).unwrap_or_else(|v| (*v).clone()))
+            .map(|t| *t.1.unwrap())
             .collect())
     }
 
@@ -400,8 +383,8 @@ pub fn eval<F, O>(
     session_state: &mut SessionState,
     mut state: Option<&mut (dyn OpState + 'static)>,
     node: &Node<F, O>,
-    input: TVec<Arc<Tensor>>,
-) -> TractResult<TVec<Arc<Tensor>>>
+    input: TVec<TensorVar>,
+) -> TractResult<TVec<Box<Tensor>>>
 where
     F: Fact + Hash + Clone + 'static,
     O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static + Hash,

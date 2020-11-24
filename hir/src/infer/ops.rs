@@ -42,12 +42,12 @@ pub trait InferenceOp:
             if infered_inputs.iter().all(|i| i.value.is_concrete()) {
                 let input_values = infered_inputs
                     .iter()
-                    .map(|i| i.value.concretize().unwrap().clone().into())
+                    .map(|i| i.value.concretize().unwrap().into_tensor().into())
                     .collect(); // checked
                 match self.eval(input_values) {
                     Ok(values) => {
                         let output_values =
-                            values.into_iter().map(|t| t.into()).collect::<TVec<_>>();
+                            values.into_iter().map(|t| (*t).into()).collect::<TVec<_>>();
                         return Ok((infered_inputs, output_values, observed));
                     }
                     Err(e) => match e {

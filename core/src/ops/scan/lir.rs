@@ -87,7 +87,7 @@ struct State {
 #[derive(Clone, Debug)]
 struct MutableState {
     position: usize,
-    hidden_state: TVec<Tensor>,
+    hidden_state: TVec<Box<Tensor>>,
     model_state: TypedSimpleState<TypedModel, Arc<TypedSimplePlan<TypedModel>>>,
 }
 
@@ -155,16 +155,16 @@ impl OpState for State {
         &mut self,
         _session: &mut SessionState,
         _op: &dyn Op,
-        inputs: TVec<Arc<Tensor>>,
-    ) -> TractResult<TVec<Arc<Tensor>>> {
+        inputs: TVec<TensorVar>,
+    ) -> TractResult<TVec<Box<Tensor>>> {
         let State { op, ref mut mutable } = self;
         // initialize state at first pass
         if mutable.hidden_state.len() == 0 {
             for input in &op.input_mapping {
                 if let InputMapping::State { initializer } = input {
                     mutable.hidden_state.push(match initializer {
-                        StateInitializer::FromInput(slot) => (*inputs[*slot]).to_owned(),
-                        StateInitializer::Value(v) => (**v).to_owned(),
+                        StateInitializer::FromInput(slot) => inputs[*slot].clone().into_tensor().boxed(),
+                        StateInitializer::Value(v) => v.as_ref().clone().boxed(),
                     });
                 }
             }
@@ -183,7 +183,7 @@ impl OpState for State {
             inputs[outside_slot].shape()[axis].div_ceil(chunk.abs() as usize)
         };
 
-        let mut outputs = tvec!();
+        let mut outputs:TVec<(usize, Box<Tensor>)> = tvec!();
         for (ix, output) in op.output_mapping.iter().enumerate() {
             if let Some(slot) = output.full_slot {
                 let fact = op.plan.model().output_fact(ix)?;
@@ -195,14 +195,14 @@ impl OpState for State {
                     .unwrap_or(shape[output.axis] * iters);
                 shape[output.axis] = scanning_dim;
                 let t = unsafe { Tensor::uninitialized_dt(fact.datum_type, &*shape)? };
-                outputs.push((slot, t));
+                outputs.push((slot, Box::new(t)));
             }
             if let Some(slot) = output.last_value_slot {
-                outputs.push((slot, Tensor::default()));
+                outputs.push((slot, Box::new(Tensor::default())));
             }
         }
         outputs.sort_by_key(|a| a.0);
-        let mut outputs: TVec<Tensor> = outputs.into_iter().map(|(_slot, v)| v).collect();
+        let mut outputs: TVec<Box<Tensor>> = outputs.into_iter().map(|(_slot, v)| v).collect();
 
         for i in 0..iters {
             mutable.position += 1;
@@ -211,25 +211,25 @@ impl OpState for State {
             }
             mutable.hidden_state.reverse();
 
-            let iter_inputs: TVec<Tensor> = op
+            let iter_inputs: TVec<TensorVar> = op
                 .input_mapping
                 .iter()
                 .map(|m| {
                     Ok(match m {
-                        InputMapping::State { .. } => Some(mutable.hidden_state.pop().unwrap()),
+                        InputMapping::Full { slot } => Some(TensorVar::from(&*inputs[*slot])),
+                        InputMapping::State { .. } => Some(mutable.hidden_state.pop().unwrap().into()),
                         InputMapping::Scan { slot, axis, chunk } => {
                             Some(MutableState::slice_input(
                                 mutable,
-                                inputs[*slot].as_ref(),
+                                &inputs[*slot],
                                 *axis,
                                 i,
                                 *chunk,
-                            )?)
+                            )?.into())
                         }
-                        InputMapping::Full { slot } => Some(inputs[*slot].clone().into_tensor()),
                     })
                 })
-                .collect::<TractResult<Vec<_>>>()?
+                .collect::<TractResult<Vec<Option<TensorVar>>>>()?
                 .into_iter()
                 .filter_map(|x| x)
                 .collect();
@@ -244,23 +244,23 @@ impl OpState for State {
                     mutable.assign_output(
                         &mut outputs[slot],
                         mapping.axis,
-                        v.as_ref(),
+                        &v,
                         i,
                         mapping.chunk < 0,
                     );
                 }
                 if i == iters - 1 {
                     if let Some(slot) = mapping.last_value_slot {
-                        outputs[slot] = v.clone().into_tensor();
+                        outputs[slot] = v.clone();
                     }
                 }
                 if mapping.state {
-                    mutable.hidden_state.push(v.into_tensor());
+                    mutable.hidden_state.push(v);
                 }
             }
         }
 
-        Ok(outputs.into_iter().map(Arc::new).collect())
+        Ok(outputs)
     }
 }
 
